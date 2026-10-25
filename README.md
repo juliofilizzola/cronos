@@ -254,7 +254,6 @@ Cobrem: disparo dentro da tolerância, cada uma das três políticas, o limite d
 - [ ] Testes de integração com Testcontainers
 - [ ] Teste de caos: matar schedulers e workers aleatoriamente e verificar que nada duplica nem se perde
 - [ ] Teste de carga com números no README
-- [ ] Helm chart, pipeline de CI e dashboard Grafana
 
 ## Limitações conhecidas
 
