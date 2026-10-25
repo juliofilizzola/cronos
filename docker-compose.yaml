@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: cronos-postgres
+    environment:
+      POSTGRES_DB: cronos
+      POSTGRES_USER: cronos
+      POSTGRES_PASSWORD: cronos
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
