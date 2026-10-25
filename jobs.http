@@ -1,0 +1,62 @@
+### 1. Criar job a cada 10 segundos (guarda o id numa variável)
+POST http://localhost:8080/jobs
+Content-Type: application/json
+
+{
+  "name": "ping-exemplo",
+  "scheduleType": "INTERVAL",
+  "scheduleExpr": "PT10S",
+  "payload": { "url": "https://example.com", "method": "GET" }
+}
+
+> {% client.global.set("jobId", response.body.id); %}
+
+### 2. Criar job cron: toda hora cheia, em horário de Brasília, pulando o que for perdido
+POST http://localhost:8080/jobs
+Content-Type: application/json
+
+{
+  "name": "relatorio-horario",
+  "scheduleType": "CRON",
+  "scheduleExpr": "0 0 * * * *",
+  "timezone": "America/Sao_Paulo",
+  "misfirePolicy": "SKIP",
+  "payload": { "url": "https://example.com/relatorio", "method": "POST" }
+}
+
+### 3. Criar job de execução única (ajuste a data para o futuro)
+POST http://localhost:8080/jobs
+Content-Type: application/json
+
+{
+  "name": "uma-vez",
+  "scheduleType": "ONCE",
+  "scheduleExpr": "2026-12-31T23:00:00Z",
+  "payload": { "url": "https://example.com/fim-de-ano" }
+}
+
+### 4. Buscar o job
+GET http://localhost:8080/jobs/{{jobId}}
+
+### 5. Listar jobs ativos
+GET http://localhost:8080/jobs?status=ACTIVE&page=0&size=20
+
+### 6. Histórico de execuções
+GET http://localhost:8080/jobs/{{jobId}}/executions
+
+### 7. Pausar
+POST http://localhost:8080/jobs/{{jobId}}/pause
+
+### 8. Retomar (a misfire policy decide o que fazer com o tempo perdido)
+POST http://localhost:8080/jobs/{{jobId}}/resume
+
+### 9. Erro esperado: cron inválido (400)
+POST http://localhost:8080/jobs
+Content-Type: application/json
+
+{
+  "name": "invalido",
+  "scheduleType": "CRON",
+  "scheduleExpr": "isso não é cron",
+  "payload": {}
+}
