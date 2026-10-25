@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: cronos
+  datasource:
+    url: jdbc:postgresql://localhost:5432/cronos
+    username: cronos
+    password: cronos
+
+cronos:
+  scheduler:
+    batch-size: 100
+    poll-interval-ms: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
