@@ -58,5 +58,33 @@ Content-Type: application/json
   "name": "invalido",
   "scheduleType": "CRON",
   "scheduleExpr": "isso não é cron",
+  "payload": { "url": "https://example.com" }
+}
+
+### 10. Erro esperado: payload sem url (400)
+POST http://localhost:8080/jobs
+Content-Type: application/json
+
+{
+  "name": "sem-url",
+  "scheduleType": "INTERVAL",
+  "scheduleExpr": "PT1M",
   "payload": {}
 }
+
+### 11. Disparar o job agora, fora do agendamento (guarda o id da execução)
+POST http://localhost:8080/jobs/{{jobId}}/trigger
+
+> {% client.global.set("executionId", response.body.id); %}
+
+### 12. Detalhe da execução
+GET http://localhost:8080/executions/{{executionId}}
+
+### 13. Cancelar a execução (PENDING ou RUNNING)
+POST http://localhost:8080/executions/{{executionId}}/cancel
+
+### 14. Retentar uma execução DEAD ou FAILED (409 se estiver em outro status)
+POST http://localhost:8080/executions/{{executionId}}/retry
+
+### 15. Métricas do Cronos
+GET http://localhost:8080/actuator/prometheus
