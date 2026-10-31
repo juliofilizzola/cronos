@@ -4,7 +4,7 @@ Agendador de jobs distribuído, escrito em Kotlin com Spring Boot e PostgreSQL.
 
 Você cadastra jobs com um agendamento (cron, intervalo ou execução única) e o Cronos garante que cada ocorrência seja registrada **uma única vez**, mesmo com várias instâncias do scheduler rodando ao mesmo tempo e mesmo depois de o sistema ficar fora do ar.
 
-> **Status:** em desenvolvimento. O scheduler, a política de misfire e a API de jobs estão prontos. O worker (que de fato executa os jobs) é o próximo passo. Veja o [roadmap](#roadmap).
+> **Status:** em desenvolvimento. O scheduler, a política de misfire, a API de jobs e o worker (com lease, heartbeat, reaper, retentativas e timeout) estão prontos. Veja o [roadmap](#roadmap).
 
 ## Sumário
 
@@ -12,6 +12,7 @@ Você cadastra jobs com um agendamento (cron, intervalo ou execução única) e 
 - [Arquitetura](#arquitetura)
 - [Como o scheduler funciona](#como-o-scheduler-funciona)
 - [Política de misfire](#política-de-misfire)
+- [Como o worker funciona](#como-o-worker-funciona)
 - [Stack](#stack)
 - [Como rodar](#como-rodar)
 - [API](#api)
@@ -44,7 +45,7 @@ flowchart LR
     subgraph Cronos
         API[API]
         Scheduler[Scheduler]
-        Worker["Worker<br/>(em desenvolvimento)"]
+        Worker[Worker]
     end
     API --> DB[(PostgreSQL)]
     Scheduler --> DB
@@ -56,7 +57,7 @@ Os três componentes não se comunicam diretamente. Toda a coordenação acontec
 
 - **API** cria, consulta, pausa e retoma jobs.
 - **Scheduler** transforma jobs vencidos em linhas na tabela `executions`.
-- **Worker** reivindica execuções pendentes e as realiza (ainda não implementado).
+- **Worker** reivindica execuções pendentes e as realiza chamando o webhook do job.
 
 Como não há comunicação entre processos, dá para subir várias réplicas de cada um sem configuração extra.
 
@@ -92,6 +93,43 @@ Exemplo: job que roda a cada minuto, sistema parado das 10:00 às 10:05:30.
 | `FIRE_ALL` | Recupera todas as ocorrências perdidas, com limite de 100 por rodada | 6 execuções (10:00 a 10:05); próximo às 10:06 |
 
 Se o limite de 100 for atingido no `FIRE_ALL`, o `next_fire_at` aponta para a próxima ocorrência ainda perdida e o tick seguinte continua de onde parou.
+
+## Como o worker funciona
+
+O worker roda na mesma aplicação (pode ser desligado com `cronos.worker.enabled=false` para ter instâncias só de scheduler).
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: scheduler cria
+    PENDING --> RUNNING: claim (SKIP LOCKED + lease)
+    RUNNING --> SUCCEEDED: 2xx
+    RUNNING --> PENDING: falha temporária, com backoff
+    RUNNING --> DEAD: falha temporária na última tentativa
+    RUNNING --> FAILED: 4xx ou payload inválido
+    RUNNING --> PENDING: lease expirou (reaper)
+```
+
+1. **Claim.** A cada 500 ms, o worker reserva até o número de slots livres (`concurrency`, padrão 16) com um único `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)`. A execução vira `RUNNING`, recebe `locked_by` (id do worker), `lease_expires_at` e `attempt + 1`. Só reserva o que consegue executar agora, para não segurar trabalho que outro worker poderia pegar.
+2. **Webhook.** Cada execução roda numa virtual thread. O payload do job define a chamada:
+   ```json
+   { "url": "https://...", "method": "POST", "headers": { "Authorization": "..." }, "body": { ... } }
+   ```
+   `method` é `POST` por padrão. O worker envia os headers `Idempotency-Key` (id da execução), `X-Cronos-Execution-Id`, `X-Cronos-Job-Id`, `X-Cronos-Attempt` e `X-Cronos-Scheduled-For`. O `timeoutSeconds` do job é o prazo total da chamada.
+3. **Resultado.** Gravado só se a execução ainda for deste worker (`WHERE locked_by = ? AND status = 'RUNNING'`). Se o lease expirou e o reaper já a devolveu para a fila, o resultado atrasado é descartado.
+
+| Resposta | Tipo | Destino |
+|---|---|---|
+| 2xx | sucesso | `SUCCEEDED` |
+| 5xx, 408, 429, timeout, erro de conexão | temporária | `PENDING` com backoff; `DEAD` ao atingir `maxAttempts` |
+| demais 4xx, payload sem `url` ou inválido | definitiva | `FAILED`, sem retentativa |
+
+**Backoff** exponencial com *equal jitter*: `base * 2^(tentativa-1)`, limitado a `backoff-max`, e sorteado entre metade e o valor cheio. Com o padrão de 1 s: ~0,5–1 s, ~1–2 s, ~2–4 s... até 5 min.
+
+**Heartbeat e reaper.** Enquanto há chamadas em andamento, o worker renova o lease a cada 10 s (lease de 30 s). Se ele morrer ou travar, o lease vence e o reaper (em qualquer instância, a cada 5 s) devolve a execução para `PENDING`, ou `DEAD` se ela já usou todas as tentativas.
+
+**Desligamento.** O worker para de reservar e espera até `shutdown-grace` (30 s) pelas chamadas em andamento. O que não terminar é recuperado pelo reaper.
+
+**Semântica de entrega: at-least-once.** Se o worker morrer depois de chamar o webhook e antes de gravar o resultado, a execução roda de novo. O destino deve deduplicar pelo `Idempotency-Key`.
 
 ## Stack
 
@@ -132,10 +170,19 @@ Para zerar o banco: `docker compose down -v`.
 |---|---|---|
 | `cronos.scheduler.batch-size` | `100` | Máximo de jobs processados por transação |
 | `cronos.scheduler.poll-interval-ms` | `1000` | Intervalo entre ticks do scheduler |
+| `cronos.worker.enabled` | `true` | Liga o worker nesta instância |
+| `cronos.worker.concurrency` | `16` | Execuções simultâneas por instância |
+| `cronos.worker.poll-interval-ms` | `500` | Intervalo entre tentativas de claim |
+| `cronos.worker.lease` | `30s` | Validade da reserva sem heartbeat |
+| `cronos.worker.heartbeat-interval-ms` | `10000` | Intervalo de renovação do lease |
+| `cronos.worker.reaper-interval-ms` | `5000` | Intervalo do reaper |
+| `cronos.worker.backoff-base` | `1s` | Espera antes da 2ª tentativa |
+| `cronos.worker.backoff-max` | `5m` | Teto do backoff |
+| `cronos.worker.shutdown-grace` | `30s` | Espera pelas execuções em andamento ao desligar |
 
 ## API
 
-O arquivo [`http/jobs.http`](http/jobs.http) tem exemplos prontos para o cliente HTTP do IntelliJ.
+O arquivo [`jobs.http`](jobs.http) tem exemplos prontos para o cliente HTTP do IntelliJ.
 
 | Método | Rota | Descrição |
 |---|---|---|
@@ -179,8 +226,8 @@ curl -X POST http://localhost:8080/jobs \
 | `misfirePolicy` | `FIRE_ONCE` | `SKIP`, `FIRE_ONCE` ou `FIRE_ALL` |
 | `misfireThresholdSeconds` | `60` | Tolerância antes de considerar misfire |
 | `allowOverlap` | `false` | Permite nova execução com outra ainda ativa |
-| `maxAttempts` | `3` | Tentativas máximas (entra em uso com o worker) |
-| `timeoutSeconds` | `60` | Tempo limite por execução (entra em uso com o worker) |
+| `maxAttempts` | `3` | Tentativas máximas (1 a 20) antes de virar `DEAD` |
+| `timeoutSeconds` | `60` | Prazo total de cada chamada ao webhook |
 
 ### Erros
 
@@ -206,17 +253,19 @@ As respostas de erro seguem o formato `ProblemDetail` (RFC 7807): `400` para age
 
 ```
 cronos/
-├── compose.yaml
-├── http/jobs.http
+├── docker-compose.yaml
+├── jobs.http
+├── scripts/e2e-workers.mjs   # teste ponta a ponta com receptor de webhooks
 └── src/
     ├── main/
     │   ├── kotlin/io/github/juliofilizzola/cronos/
     │   │   ├── api/           # controller, DTO de entrada, tratamento de erros
     │   │   ├── service/       # regras de negócio e validação de agendamento
-    │   │   ├── persistence/   # repositório com SQL explícito
+    │   │   ├── persistence/   # repositórios com SQL explícito (jobs e executions)
     │   │   ├── scheduling/    # SchedulerLoop, MisfireResolver, NextFireCalculator
+    │   │   ├── worker/        # Worker, WebhookClient, RetryPolicy, WorkerProperties
     │   │   ├── domain/        # Job, JobDetails, enums, exceções
-    │   │   └── config/        # beans (Clock, calculadora, resolver)
+    │   │   └── config/        # beans (Clock, calculadora, resolver, retry, cliente HTTP)
     │   └── resources/
     │       ├── application.yaml
     │       └── db/migration/  # V1__init.sql, V2__misfire_and_completed.sql
@@ -225,19 +274,30 @@ cronos/
 
 ## Testes
 
-Com o banco no ar:
+Com o Docker no ar (o teste de contexto sobe um PostgreSQL via Testcontainers):
 
 ```bash
 ./gradlew test
 ```
 
-Os testes do `MisfireResolver` não dependem de banco e podem rodar isolados:
+Os testes unitários não dependem de banco e podem rodar isolados:
 
 ```bash
-./gradlew test --tests '*MisfireResolverTest'
+./gradlew test --tests '*MisfireResolverTest' --tests '*RetryPolicyTest'
 ```
 
-Cobrem: disparo dentro da tolerância, cada uma das três políticas, o limite do `FIRE_ALL`, cron com a próxima ocorrência futura e job `ONCE` perdido.
+- `MisfireResolverTest`: disparo dentro da tolerância, cada uma das três políticas, o limite do `FIRE_ALL`, cron com a próxima ocorrência futura e job `ONCE` perdido.
+- `RetryPolicyTest`: sucesso, retentativa, `DEAD` na última tentativa, falha definitiva, crescimento e teto do backoff e classificação dos status HTTP.
+
+### Teste ponta a ponta
+
+Com a aplicação rodando, o script [`scripts/e2e-workers.mjs`](scripts/e2e-workers.mjs) (Node 22, sem dependências) sobe um receptor de webhooks na porta 4000, cria cinco jobs (sucesso, sem sobreposição, falha 500, webhook lento e `ONCE`), mostra cada transição de status e cada chamada recebida em tempo real e, no fim, roda 11 verificações: nada duplicado, entrega única, `Idempotency-Key`, sobreposição, retentativas, `DEAD`, timeout e `ONCE`.
+
+```bash
+node scripts/e2e-workers.mjs
+```
+
+Variáveis: `CRONOS_URL` (padrão `http://localhost:8080`), `WEBHOOK_PORT` (`4000`), `WEBHOOK_HOST` (`localhost`; use `host.docker.internal` se o Cronos rodar em container) e `DURATION_S` (`30`). Sai com código 0 se tudo passar. Os jobs criados são pausados no final.
 
 ## Roadmap
 
@@ -245,10 +305,12 @@ Cobrem: disparo dentro da tolerância, cada uma das três políticas, o limite d
 - [x] Scheduler com `SKIP LOCKED` e deduplicação por `UNIQUE`
 - [x] Política de misfire (`SKIP`, `FIRE_ONCE`, `FIRE_ALL`)
 - [x] API de jobs (criar, consultar, listar, pausar, retomar) e histórico de execuções
-- [ ] Worker: claim de execuções com lease e execução de webhooks
-- [ ] Heartbeat e reaper para recuperar execuções de workers que morreram
-- [ ] Retentativas com backoff exponencial e jitter, e dead-letter (`DEAD`)
-- [ ] Timeout e cancelamento de execuções
+- [x] Worker: claim de execuções com lease e execução de webhooks
+- [x] Heartbeat e reaper para recuperar execuções de workers que morreram
+- [x] Retentativas com backoff exponencial e jitter, e dead-letter (`DEAD`)
+- [x] Timeout de execuções
+- [x] Teste ponta a ponta com receptor de webhooks (`scripts/e2e-workers.mjs`)
+- [ ] Cancelamento de execuções em andamento
 - [ ] Endpoint de disparo manual e retentativa de execução `DEAD`
 - [ ] Métricas customizadas (atraso de disparo, taxa de falha, misfires)
 - [ ] Testes de integração com Testcontainers
@@ -257,10 +319,11 @@ Cobrem: disparo dentro da tolerância, cada uma das três políticas, o limite d
 
 ## Limitações conhecidas
 
-- **As execuções ainda não são realizadas.** Sem o worker, elas permanecem `PENDING`.
 - **Sem autenticação** na API.
+- **O payload não é validado na criação do job.** Um job sem `url` é aceito e cada execução termina em `FAILED`.
+- **Sem proteção contra SSRF:** o worker chama qualquer URL `http`/`https` do payload, inclusive endereços internos.
 - **Dependência de relógio:** o scheduler usa o relógio da JVM. Com instâncias com horários muito diferentes, os disparos podem variar levemente. Usar o `now()` do PostgreSQL é uma alternativa avaliada.
-- **Garantia de entrega planejada:** *at-least-once*, o que exige idempotência do lado de quem recebe. O `id` da execução será enviado como chave de idempotência.
+- **Garantia de entrega:** *at-least-once*, o que exige idempotência do lado de quem recebe. O `id` da execução vai no header `Idempotency-Key`.
 
 ## Autor
 

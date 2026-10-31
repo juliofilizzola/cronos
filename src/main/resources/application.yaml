@@ -5,11 +5,26 @@ spring:
     url: jdbc:postgresql://localhost:5432/cronos
     username: cronos
     password: cronos
+  task:
+    scheduling:
+      pool:
+        # scheduler, poll do worker, heartbeat e reaper não devem esperar um pelo outro
+        size: 4
 
 cronos:
   scheduler:
     batch-size: 100
     poll-interval-ms: 1000
+  worker:
+    enabled: true
+    concurrency: 16
+    poll-interval-ms: 500
+    lease: 30s
+    heartbeat-interval-ms: 10000
+    reaper-interval-ms: 5000
+    backoff-base: 1s
+    backoff-max: 5m
+    shutdown-grace: 30s
 
 management:
   endpoints:
