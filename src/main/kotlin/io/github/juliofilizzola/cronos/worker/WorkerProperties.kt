@@ -12,6 +12,8 @@ data class WorkerProperties(
     /** Quanto tempo a execução fica reservada sem heartbeat antes do reaper liberá-la. */
     val lease: Duration = Duration.ofSeconds(30),
     val heartbeatIntervalMs: Long = 10_000,
+    /** Intervalo para checar se alguma execução em andamento foi cancelada pela API. */
+    val cancelCheckIntervalMs: Long = 1_000,
     val reaperIntervalMs: Long = 5_000,
     val backoffBase: Duration = Duration.ofSeconds(1),
     val backoffMax: Duration = Duration.ofMinutes(5),

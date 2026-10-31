@@ -1,6 +1,7 @@
 package io.github.juliofilizzola.cronos.api
 
 import io.github.juliofilizzola.cronos.domain.ConflictException
+import io.github.juliofilizzola.cronos.domain.InvalidPayloadException
 import io.github.juliofilizzola.cronos.domain.InvalidScheduleException
 import io.github.juliofilizzola.cronos.domain.NotFoundException
 import org.springframework.http.HttpStatus
@@ -22,4 +23,8 @@ class ApiExceptionHandler {
     @ExceptionHandler(InvalidScheduleException::class)
     fun invalidSchedule(e: InvalidScheduleException): ProblemDetail =
         ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.message ?: "Agendamento inválido")
+
+    @ExceptionHandler(InvalidPayloadException::class)
+    fun invalidPayload(e: InvalidPayloadException): ProblemDetail =
+        ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.message ?: "Payload inválido")
 }

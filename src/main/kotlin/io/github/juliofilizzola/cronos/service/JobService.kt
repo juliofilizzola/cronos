@@ -2,9 +2,12 @@ package io.github.juliofilizzola.cronos.service
 
 import io.github.juliofilizzola.cronos.api.CreateJobRequest
 import io.github.juliofilizzola.cronos.domain.*
+import io.github.juliofilizzola.cronos.persistence.ExecutionRepository
 import io.github.juliofilizzola.cronos.persistence.JobRepository
 import io.github.juliofilizzola.cronos.scheduling.NextFireCalculator
 import org.springframework.stereotype.Service
+import tools.jackson.databind.JsonNode
+import java.net.URI
 import java.time.Clock
 import java.time.DateTimeException
 import java.time.Duration
@@ -15,6 +18,7 @@ import java.util.UUID
 @Service
 class JobService(
     private val repository: JobRepository,
+    private val executionRepository: ExecutionRepository,
     private val calculator: NextFireCalculator,
     private val clock: Clock,
 ) {
@@ -25,6 +29,7 @@ class JobService(
         } catch (e: DateTimeException) {
             throw InvalidScheduleException("Fuso horário inválido: ${request.timezone}")
         }
+        validatePayload(request.payload)
         val now = clock.instant()
 
         val job = JobDetails(
@@ -55,7 +60,7 @@ class JobService(
 
     fun executions(jobId: UUID, page: Int, size: Int): List<ExecutionView> {
         get(jobId) // garante 404 se o job não existe
-        return repository.findExecutions(jobId, size, page * size)
+        return executionRepository.findByJob(jobId, size, page * size)
     }
 
     fun pause(id: UUID): JobDetails = transition(id, JobStatus.ACTIVE, JobStatus.PAUSED)
@@ -72,6 +77,31 @@ class JobService(
             throw ConflictException("Job está ${current.status}, esperado $from para ir a $to")
         }
         return get(id)
+    }
+
+    /** Mesmas regras que o worker aplica ao chamar o webhook, para o erro aparecer já na criação. */
+    private fun validatePayload(payload: JsonNode) {
+        if (!payload.isObject) throw InvalidPayloadException("payload deve ser um objeto JSON")
+        val url = payload.get("url")
+        if (url == null || !url.isString || url.asString().isBlank()) {
+            throw InvalidPayloadException("payload.url é obrigatório")
+        }
+        val uri = try {
+            URI.create(url.asString())
+        } catch (e: IllegalArgumentException) {
+            throw InvalidPayloadException("payload.url inválida: ${url.asString()}")
+        }
+        if (uri.scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
+            throw InvalidPayloadException("payload.url deve ser http ou https com host")
+        }
+        val method = payload.get("method")
+        if (method != null && (!method.isString || method.asString().uppercase() !in HTTP_METHODS)) {
+            throw InvalidPayloadException("payload.method deve ser um de $HTTP_METHODS")
+        }
+        val headers = payload.get("headers")
+        if (headers != null && (!headers.isObject || headers.properties().any { !it.value.isString })) {
+            throw InvalidPayloadException("payload.headers deve ser um objeto de strings")
+        }
     }
 
     private fun firstFireAt(request: CreateJobRequest, zone: ZoneId, now: Instant): Instant {
@@ -113,5 +143,9 @@ class JobService(
             throw InvalidScheduleException("Expressão inválida (${request.scheduleType}): ${e.message}")
         }
         return next ?: throw InvalidScheduleException("A expressão nunca dispara")
+    }
+
+    private companion object {
+        val HTTP_METHODS = setOf("GET", "POST", "PUT", "PATCH", "DELETE")
     }
 }

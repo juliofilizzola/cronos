@@ -32,4 +32,5 @@ data class ExecutionView(
     val startedAt: Instant?,
     val finishedAt: Instant?,
     val lastError: String?,
+    val triggeredBy: String,
 )

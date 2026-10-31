@@ -9,6 +9,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.concurrent.CancellationException
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -30,7 +31,11 @@ class WebhookClient(
         .build(),
 ) {
 
-    fun call(execution: ClaimedExecution): AttemptResult {
+    /**
+     * [onSend] recebe a chamada em andamento: cancelá-la aborta a requisição
+     * (é assim que o cancelamento via API interrompe uma execução RUNNING).
+     */
+    fun call(execution: ClaimedExecution, onSend: (CompletableFuture<*>) -> Unit = {}): AttemptResult {
         val request = try {
             buildRequest(execution)
         } catch (e: Exception) {
@@ -39,6 +44,7 @@ class WebhookClient(
 
         // Prazo total (conexão + resposta + corpo), não só até os headers chegarem.
         val future = http.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        onSend(future)
         return try {
             val response = future.get(execution.timeoutSeconds.toLong(), TimeUnit.SECONDS)
             classify(response.statusCode(), response.body())
@@ -50,7 +56,7 @@ class WebhookClient(
             val detail = cause.message?.let { ": $it" } ?: ""
             AttemptResult.Failure("${cause.javaClass.simpleName}$detail", retryable = true)
         } catch (e: CancellationException) {
-            AttemptResult.Failure("cancelada", retryable = true)
+            AttemptResult.Failure("cancelada", retryable = false)
         } catch (e: InterruptedException) {
             future.cancel(true)
             Thread.currentThread().interrupt()

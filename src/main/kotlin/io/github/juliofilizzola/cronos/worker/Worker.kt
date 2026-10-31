@@ -2,6 +2,9 @@ package io.github.juliofilizzola.cronos.worker
 
 import io.github.juliofilizzola.cronos.persistence.ClaimedExecution
 import io.github.juliofilizzola.cronos.persistence.ExecutionRepository
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import jakarta.annotation.PreDestroy
 import org.slf4j.LoggerFactory
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
@@ -10,7 +13,10 @@ import org.springframework.stereotype.Component
 import java.lang.management.ManagementFactory
 import java.net.InetAddress
 import java.time.Clock
+import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -35,6 +41,7 @@ class Worker(
     private val retryPolicy: RetryPolicy,
     private val clock: Clock,
     private val props: WorkerProperties,
+    private val meters: MeterRegistry,
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
@@ -43,51 +50,92 @@ class Worker(
 
     private val slots = Semaphore(props.concurrency)
     private val executor = Executors.newVirtualThreadPerTaskExecutor()
+    /** Execuções em andamento nesta instância, para poder interrompê-las ao cancelar. */
+    private val inFlight = ConcurrentHashMap<UUID, InFlight>()
     @Volatile private var stopping = false
 
+    private val startDelay = Timer.builder("cronos.execution.start.delay")
+        .description("Atraso entre o horário lógico (scheduled_for) e o início da 1ª tentativa")
+        .publishPercentiles(0.5, 0.95, 0.99)
+        .register(meters)
+    private val reaped = Counter.builder("cronos.worker.reaped")
+        .description("Execuções recuperadas de workers que pararam de responder").register(meters)
+
     init {
+        meters.gauge("cronos.worker.inflight", inFlight) { it.size.toDouble() }
         log.info("Worker {} iniciado (concorrência={})", workerId, props.concurrency)
     }
 
     @Scheduled(fixedDelayString = "\${cronos.worker.poll-interval-ms:500}")
     fun poll() {
-        if (stopping) return
-        // Só reserva o que consegue executar agora: o resto fica livre para outros workers.
-        val free = slots.availablePermits()
-        if (free == 0) return
-
-        val now = clock.instant()
-        val claimed = repository.claim(workerId, free, now, now.plus(props.lease))
-        for (execution in claimed) {
-            slots.acquire()
-            executor.submit {
-                try {
-                    run(execution)
-                } finally {
-                    slots.release()
+        // Enquanto houver trabalho, continua reservando assim que um slot vagar,
+        // sem esperar o próximo tick. Só reserva o que consegue executar agora:
+        // o resto fica livre para outros workers.
+        while (!stopping) {
+            val free = slots.availablePermits()
+            if (free == 0) {
+                if (!slots.tryAcquire(props.pollIntervalMs, TimeUnit.MILLISECONDS)) return
+                slots.release()
+                continue
+            }
+            val now = clock.instant()
+            val claimed = repository.claim(workerId, free, now, now.plus(props.lease))
+            for (execution in claimed) {
+                if (execution.attempt == 1) {
+                    startDelay.record(Duration.between(execution.scheduledFor, now).coerceAtLeast(Duration.ZERO))
+                }
+                slots.acquire()
+                val handle = InFlight()
+                inFlight[execution.id] = handle
+                executor.submit {
+                    try {
+                        run(execution, handle)
+                    } finally {
+                        inFlight.remove(execution.id)
+                        slots.release()
+                    }
                 }
             }
+            if (claimed.size < free) return // fila vazia por enquanto
         }
     }
 
     @Scheduled(fixedDelayString = "\${cronos.worker.heartbeat-interval-ms:10000}")
     fun heartbeat() {
-        if (slots.availablePermits() == props.concurrency) return // nada em andamento
+        if (inFlight.isEmpty()) return
         repository.extendLeases(workerId, clock.instant().plus(props.lease))
+    }
+
+    /** Interrompe as execuções em andamento que foram canceladas pela API. */
+    @Scheduled(fixedDelayString = "\${cronos.worker.cancel-check-interval-ms:1000}")
+    fun checkCancelled() {
+        if (inFlight.isEmpty()) return
+        for (id in repository.findCancelled(workerId, inFlight.keys.toList())) {
+            inFlight[id]?.let {
+                log.info("Execução {} cancelada via API: interrompendo", id)
+                it.cancel()
+            }
+        }
     }
 
     @Scheduled(fixedDelayString = "\${cronos.worker.reaper-interval-ms:5000}")
     fun reap() {
-        val reaped = repository.reapExpired(clock.instant())
-        if (reaped > 0) log.warn("Reaper recuperou {} execução(ões) com lease expirado", reaped)
+        val count = repository.reapExpired(clock.instant())
+        if (count > 0) {
+            reaped.increment(count.toDouble())
+            log.warn("Reaper recuperou {} execução(ões) com lease expirado", count)
+        }
     }
 
-    private fun run(execution: ClaimedExecution) {
+    private fun run(execution: ClaimedExecution, handle: InFlight) {
+        val sample = Timer.start(meters)
         val result = try {
-            webhook.call(execution)
+            webhook.call(execution) { handle.attach(it) }
         } catch (e: Exception) {
             AttemptResult.Failure("erro inesperado: ${e.message}", retryable = true)
         }
+        sample.stop(meters.timer("cronos.webhook.duration",
+            "result", if (result is AttemptResult.Success) "success" else "failure"))
 
         val now = clock.instant()
         val outcome = retryPolicy.decide(result, execution.attempt, execution.maxAttempts, now)
@@ -101,23 +149,57 @@ class Worker(
         } catch (e: Exception) {
             // O lease vai vencer e o reaper devolve a execução para a fila.
             log.error("Falha ao gravar resultado da execução {}", execution.id, e)
+            count("error")
             return
         }
 
         if (updated == 0) {
-            log.warn("Execução {} não pertence mais a {} (lease expirou?): resultado descartado",
-                execution.id, workerId)
+            // Cancelada pela API ou recuperada pelo reaper depois que o lease venceu.
+            log.info("Execução {} não está mais RUNNING para {}: resultado descartado", execution.id, workerId)
+            count("discarded")
             return
         }
         when (outcome) {
-            Outcome.Succeeded -> log.debug("Execução {} concluída (tentativa {})", execution.id, execution.attempt)
-            is Outcome.Retry -> log.info("Execução {} falhou na tentativa {}/{}: {}. Nova tentativa em {}",
-                execution.id, execution.attempt, execution.maxAttempts, outcome.error, outcome.runAfter)
-            is Outcome.Dead -> log.warn("Execução {} DEAD após {} tentativas: {}",
-                execution.id, execution.attempt, outcome.error)
-            is Outcome.Failed -> log.warn("Execução {} FAILED sem retentativa: {}", execution.id, outcome.error)
+            Outcome.Succeeded -> {
+                count("succeeded")
+                log.debug("Execução {} concluída (tentativa {})", execution.id, execution.attempt)
+            }
+            is Outcome.Retry -> {
+                count("retry")
+                log.info("Execução {} falhou na tentativa {}/{}: {}. Nova tentativa em {}",
+                    execution.id, execution.attempt, execution.maxAttempts, outcome.error, outcome.runAfter)
+            }
+            is Outcome.Dead -> {
+                count("dead")
+                log.warn("Execução {} DEAD após {} tentativas: {}", execution.id, execution.attempt, outcome.error)
+            }
+            is Outcome.Failed -> {
+                count("failed")
+                log.warn("Execução {} FAILED sem retentativa: {}", execution.id, outcome.error)
+            }
         }
     }
+
+    /**
+     * Cancelar aborta só a chamada HTTP, sem interromper a thread: um interrupt numa
+     * virtual thread fecharia a conexão JDBC se chegasse durante a gravação do resultado.
+     */
+    private class InFlight {
+        @Volatile private var call: CompletableFuture<*>? = null
+        @Volatile private var cancelled = false
+
+        fun attach(future: CompletableFuture<*>) {
+            call = future
+            if (cancelled) future.cancel(true) // cancelamento chegou antes do envio
+        }
+
+        fun cancel() {
+            cancelled = true
+            call?.cancel(true)
+        }
+    }
+
+    private fun count(outcome: String) = meters.counter("cronos.worker.executions", "outcome", outcome).increment()
 
     @PreDestroy
     fun shutdown() {
