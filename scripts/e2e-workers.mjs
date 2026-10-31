@@ -31,7 +31,7 @@ const c = (code) => (s) => (process.stdout.isTTY ? `\x1b[${code}m${s}\x1b[0m` : 
 const gray = c(90), green = c(32), red = c(31), yellow = c(33), cyan = c(36), magenta = c(35), bold = c(1);
 
 const STATUS_COLOR = {
-    PENDING: yellow, RUNNING: cyan, SUCCEEDED: green, FAILED: red, DEAD: magenta,
+    PENDING: yellow, RUNNING: cyan, SUCCEEDED: green, FAILED: red, DEAD: magenta, CANCELLED: gray,
 };
 const paint = (status) => (STATUS_COLOR[status] ?? ((s) => s))(status);
 
@@ -66,6 +66,14 @@ const scenarios = [
             scheduleType: "INTERVAL", scheduleExpr: "PT5S", allowOverlap: true, maxAttempts: 3,
             payload: { url: hook("/fail"), method: "POST" },
         },
+        // A primeira execução DEAD é recolocada na fila via POST /executions/{id}/retry.
+        onTransition: async (e) => {
+            if (e.status === "DEAD" && !actions.retried) {
+                actions.retried = e.id;
+                await api("POST", `/executions/${e.id}/retry`);
+                log(yellow("-> retry"), `exec=${e.id.slice(0, 8)}`);
+            }
+        },
     },
     {
         key: "slow",
@@ -73,6 +81,31 @@ const scenarios = [
         body: {
             scheduleType: "INTERVAL", scheduleExpr: "PT10S", allowOverlap: true, timeoutSeconds: 2,
             payload: { url: hook("/slow?ms=5000"), method: "POST" },
+        },
+    },
+    {
+        key: "manual",
+        description: "ONCE em 2099, disparado na hora via POST /jobs/{id}/trigger",
+        body: {
+            scheduleType: "ONCE", scheduleExpr: "2099-01-01T00:00:00Z",
+            payload: { url: hook("/ok"), method: "POST" },
+        },
+        afterCreate: async (job) => api("POST", `/jobs/${job.id}/trigger`),
+    },
+    {
+        key: "cancel",
+        description: "webhook segura 20s; a execução é cancelada via API assim que fica RUNNING",
+        body: {
+            scheduleType: "ONCE", scheduleExpr: "2099-01-01T00:00:00Z", timeoutSeconds: 30,
+            payload: { url: hook("/slow?ms=20000"), method: "POST" },
+        },
+        afterCreate: async (job) => api("POST", `/jobs/${job.id}/trigger`),
+        onTransition: async (e) => {
+            if (e.status === "RUNNING" && !actions.cancelled) {
+                actions.cancelled = e.id;
+                await api("POST", `/executions/${e.id}/cancel`);
+                log(yellow("-> cancel"), `exec=${e.id.slice(0, 8)}`);
+            }
         },
     },
     {
@@ -90,6 +123,7 @@ const scenarios = [
 // Receptor de webhooks
 // ---------------------------------------------------------------------------
 const hits = []; // { at, path, method, headers, body, scenario }
+const actions = { cancelled: null, retried: null };
 const failCount = new Map(); // execução -> nº de chamadas em /fail
 
 function executionIdFrom(req, body) {
@@ -162,6 +196,9 @@ async function poll() {
                     gray(`tentativa ${e.attempt}`) + err);
             }
             seen.set(e.id, { ...e, jobKey: job.scenario.key });
+            if (job.scenario.onTransition && (!prev || prev.status !== e.status || prev.attempt !== e.attempt)) {
+                await job.scenario.onTransition(e);
+            }
         }
     }
 }
@@ -171,7 +208,7 @@ function summarize() {
 
     const all = [...seen.values()];
     const byJob = Object.groupBy(all, (e) => e.jobKey);
-    const statuses = ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "DEAD"];
+    const statuses = ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "DEAD", "CANCELLED"];
 
     console.log(bold("\nExecuções por job"));
     console.table(Object.fromEntries(jobs.map(({ scenario }) => {
@@ -229,7 +266,25 @@ function summarize() {
     check(slow.some((e) => e.lastError && /timeout|timed out/i.test(e.lastError)),
         "Webhook lento falha por timeout", slow.map((e) => e.lastError).filter(Boolean)[0] ?? "");
 
-    // 9. ONCE
+    // 9. Disparo manual
+    const manual = byJob["manual"] ?? [];
+    check(manual.length === 1 && manual[0].triggeredBy === "MANUAL" && manual[0].status === "SUCCEEDED",
+        "Disparo manual cria e executa uma execução MANUAL", manual.map((e) => `${e.triggeredBy}/${e.status}`).join(",") || "nenhuma");
+
+    // 10. Cancelamento de execução em andamento
+    const cancelled = actions.cancelled && seen.get(actions.cancelled);
+    check(cancelled?.status === "CANCELLED", "Execução RUNNING cancelada via API fica CANCELLED",
+        cancelled ? cancelled.status : "nunca ficou RUNNING");
+
+    // 11. Retentativa manual de DEAD
+    const retried = actions.retried && seen.get(actions.retried);
+    // 3 tentativas antes do retry + 3 depois, todas com o mesmo Idempotency-Key.
+    const retriedCalls = hits.filter((h) => actions.retried && h.execId === actions.retried).length;
+    check(retriedCalls === 6 && retried?.status === "DEAD",
+        "Execução DEAD retentada via API volta para a fila e roda de novo",
+        retried ? `${retriedCalls} chamadas com o mesmo id, status ${retried.status}` : "nenhuma DEAD");
+
+    // 12. ONCE
     const once = byJob["once"] ?? [];
     check(once.length === 1, "Job ONCE gerou exatamente 1 execução", `${once.length} execuções`);
 
@@ -272,6 +327,7 @@ async function main() {
         const job = await api("POST", "/jobs", { name: `e2e-${RUN_ID}-${scenario.key}`, ...scenario.body });
         jobs.push({ scenario, id: job.id });
         log(bold("job criado"), scenario.key.padEnd(10), gray(job.id), "-", scenario.description);
+        if (scenario.afterCreate) await scenario.afterCreate(job);
     }
     console.log();
 
