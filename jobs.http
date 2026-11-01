@@ -1,5 +1,8 @@
+# Variáveis em http-client.env.json (ambiente "local"; a chave é a do perfil local do bootRun).
+
 ### 1. Criar job a cada 10 segundos (guarda o id numa variável)
 POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
 Content-Type: application/json
 
 {
@@ -13,6 +16,7 @@ Content-Type: application/json
 
 ### 2. Criar job cron: toda hora cheia, em horário de Brasília, pulando o que for perdido
 POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
 Content-Type: application/json
 
 {
@@ -26,6 +30,7 @@ Content-Type: application/json
 
 ### 3. Criar job de execução única (ajuste a data para o futuro)
 POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
 Content-Type: application/json
 
 {
@@ -37,21 +42,27 @@ Content-Type: application/json
 
 ### 4. Buscar o job
 GET http://localhost:8080/jobs/{{jobId}}
+Authorization: Bearer {{apiKey}}
 
 ### 5. Listar jobs ativos
 GET http://localhost:8080/jobs?status=ACTIVE&page=0&size=20
+Authorization: Bearer {{apiKey}}
 
 ### 6. Histórico de execuções
 GET http://localhost:8080/jobs/{{jobId}}/executions
+Authorization: Bearer {{apiKey}}
 
 ### 7. Pausar
 POST http://localhost:8080/jobs/{{jobId}}/pause
+Authorization: Bearer {{apiKey}}
 
 ### 8. Retomar (a misfire policy decide o que fazer com o tempo perdido)
 POST http://localhost:8080/jobs/{{jobId}}/resume
+Authorization: Bearer {{apiKey}}
 
 ### 9. Erro esperado: cron inválido (400)
 POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
 Content-Type: application/json
 
 {
@@ -63,6 +74,7 @@ Content-Type: application/json
 
 ### 10. Erro esperado: payload sem url (400)
 POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
 Content-Type: application/json
 
 {
@@ -74,17 +86,41 @@ Content-Type: application/json
 
 ### 11. Disparar o job agora, fora do agendamento (guarda o id da execução)
 POST http://localhost:8080/jobs/{{jobId}}/trigger
+Authorization: Bearer {{apiKey}}
 
 > {% client.global.set("executionId", response.body.id); %}
 
 ### 12. Detalhe da execução
 GET http://localhost:8080/executions/{{executionId}}
+Authorization: Bearer {{apiKey}}
 
 ### 13. Cancelar a execução (PENDING ou RUNNING)
 POST http://localhost:8080/executions/{{executionId}}/cancel
+Authorization: Bearer {{apiKey}}
 
 ### 14. Retentar uma execução DEAD ou FAILED (409 se estiver em outro status)
 POST http://localhost:8080/executions/{{executionId}}/retry
+Authorization: Bearer {{apiKey}}
 
 ### 15. Métricas do Cronos
 GET http://localhost:8080/actuator/prometheus
+Authorization: Bearer {{apiKey}}
+
+### 16. Apagar o job e todo o histórico (204)
+DELETE http://localhost:8080/jobs/{{jobId}}
+Authorization: Bearer {{apiKey}}
+
+### 17. Erro esperado: sem chave (401)
+GET http://localhost:8080/jobs
+
+### 18. Erro esperado: destino interno bloqueado contra SSRF (400 fora do perfil local)
+POST http://localhost:8080/jobs
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "name": "metadata",
+  "scheduleType": "ONCE",
+  "scheduleExpr": "2099-01-01T00:00:00Z",
+  "payload": { "url": "http://169.254.169.254/latest/meta-data" }
+}
