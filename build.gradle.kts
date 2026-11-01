@@ -48,6 +48,10 @@ kotlin {
     }
 }
 
+tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
+    systemProperty("spring.profiles.active", System.getenv("SPRING_PROFILES_ACTIVE") ?: "local")
+}
+
 tasks.withType<Test> {
     useJUnitPlatform()
 }
