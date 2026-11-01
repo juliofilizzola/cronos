@@ -32,6 +32,7 @@ const BASE_PORT = Number(process.env.BASE_PORT ?? 8081);
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 4100);
 const JAVA = process.env.JAVA ?? "java";
 const LOG_DIR = path.join(ROOT, "build", "chaos-logs");
+const API_KEY = "chaos-key";
 
 const c = (code) => (s) => (process.stdout.isTTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const gray = c(90), green = c(32), red = c(31), yellow = c(33), bold = c(1);
@@ -80,6 +81,8 @@ function start(inst) {
         "--cronos.worker.heartbeat-interval-ms=1000",
         "--cronos.worker.reaper-interval-ms=1000",
         "--cronos.worker.shutdown-grace=1s",
+        `--cronos.security.api-keys=${API_KEY}`,
+        "--cronos.webhook.allow-private-networks=true", // o receptor roda em localhost
     ], { stdio: ["ignore", out, out] });
     inst.starts++;
     const proc = inst.proc;
@@ -121,7 +124,7 @@ async function api(method, p, body) {
             try {
                 const r = await fetch(`http://localhost:${inst.port}${p}`, {
                     method, signal: AbortSignal.timeout(5000),
-                    headers: body ? { "content-type": "application/json" } : {},
+                    headers: { ...(body ? { "content-type": "application/json" } : {}), authorization: `Bearer ${API_KEY}` },
                     body: body ? JSON.stringify(body) : undefined,
                 });
                 const text = await r.text();
