@@ -5,7 +5,9 @@ import io.github.juliofilizzola.cronos.domain.*
 import io.github.juliofilizzola.cronos.persistence.ExecutionRepository
 import io.github.juliofilizzola.cronos.persistence.JobRepository
 import io.github.juliofilizzola.cronos.scheduling.NextFireCalculator
+import io.github.juliofilizzola.cronos.security.UrlGuard
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
 import tools.jackson.databind.JsonNode
 import java.net.URI
 import java.time.Clock
@@ -20,13 +22,14 @@ class JobService(
     private val repository: JobRepository,
     private val executionRepository: ExecutionRepository,
     private val calculator: NextFireCalculator,
+    private val guard: UrlGuard,
     private val clock: Clock,
 ) {
 
     fun create(request: CreateJobRequest): JobDetails {
         val zone = try {
             ZoneId.of(request.timezone)
-        } catch (e: DateTimeException) {
+        } catch (_: DateTimeException) {
             throw InvalidScheduleException("Fuso horário inválido: ${request.timezone}")
         }
         validatePayload(request.payload)
@@ -63,6 +66,15 @@ class JobService(
         return executionRepository.findByJob(jobId, size, page * size)
     }
 
+    /**
+     * Apaga o job e o histórico. Execuções em andamento são abandonadas: o resultado do
+     * worker é descartado porque a linha não existe mais.
+     */
+    @Transactional
+    fun delete(id: UUID) {
+        if (!repository.deleteWithHistory(id)) throw NotFoundException("Job $id não encontrado")
+    }
+
     fun pause(id: UUID): JobDetails = transition(id, JobStatus.ACTIVE, JobStatus.PAUSED)
 
     /**
@@ -94,6 +106,7 @@ class JobService(
         if (uri.scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
             throw InvalidPayloadException("payload.url deve ser http ou https com host")
         }
+        guard.check(uri)?.let { throw InvalidPayloadException("payload.url: ${it.reason}") }
         val method = payload.get("method")
         if (method != null && (!method.isString || method.asString().uppercase() !in HTTP_METHODS)) {
             throw InvalidPayloadException("payload.method deve ser um de $HTTP_METHODS")
