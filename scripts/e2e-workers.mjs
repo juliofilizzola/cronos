@@ -329,6 +329,10 @@ async function runPreChecks() {
     const noKey = await raw("GET", "/jobs", null, null);
     const badKey = await raw("GET", "/jobs", null, "chave-errada");
     const health = await raw("GET", "/actuator/health", null, null);
+    const ok = await raw("GET", "/jobs?size=1");
+    check(ok.headers.get("x-ratelimit-limit") !== null && ok.headers.get("x-ratelimit-remaining") !== null,
+        "Respostas autenticadas trazem X-RateLimit-Limit e X-RateLimit-Remaining",
+        `limit=${ok.headers.get("x-ratelimit-limit")} remaining=${ok.headers.get("x-ratelimit-remaining")}`);
     check(noKey.status === 401 && badKey.status === 401 && health.ok,
         "API exige chave (401 sem chave ou com chave errada; health público)",
         `sem=${noKey.status} errada=${badKey.status} health=${health.status}`);
