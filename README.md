@@ -161,6 +161,7 @@ Expostas em `/actuator/prometheus`. Os nomes abaixo estão no formato do Microme
 | `cronos.worker.inflight` | gauge | Execuções em andamento nesta instância |
 | `cronos.worker.reaped` | contador | Execuções recuperadas de workers que pararam de responder |
 | `cronos.retention.deleted` | contador | Execuções apagadas pela retenção |
+| `cronos.security.rate.limited{reason}` | contador | Respostas `429`: `key` (limite da chave) ou `auth` (tentativas inválidas por IP) |
 
 Taxa de falha, por exemplo: `sum(rate(cronos_worker_executions_total{outcome=~"retry|dead|failed"}[5m])) / sum(rate(cronos_worker_executions_total[5m]))`.
 
@@ -174,6 +175,34 @@ Cada requisição precisa de uma API key em `Authorization: Bearer <chave>` ou `
 - **Várias chaves ao mesmo tempo**, para rotação: adicione a nova em `CRONOS_API_KEYS`, migre os clientes e remova a antiga.
 - **Comparação em tempo constante** sobre o SHA-256 das chaves, para o tempo de resposta não revelar quanto da chave está certo.
 - É um filtro de servlet simples, sem Spring Security: todas as chaves têm o mesmo acesso. Não há usuários, papéis nem escopos por job.
+
+### Rate limit
+
+O mesmo filtro aplica dois limites por *token bucket* ([`TokenBucketLimiter`](src/main/kotlin/io/github/juliofilizzola/cronos/security/TokenBucketLimiter.kt)). Cada cliente tem um balde de fichas que se recarrega numa vazão fixa, e cada requisição gasta uma: o tamanho do balde é a rajada tolerada, a recarga é a vazão sustentada.
+
+| Limite | Por | Padrão | Para quê |
+|---|---|---|---|
+| Requisições autenticadas | chave | 200/s, rajada de 400 | Um cliente abusivo (ou com bug em loop) não derruba o banco para os outros |
+| Tentativas sem chave válida | IP | 10/min, rajada de 10 | Frear força bruta de chaves |
+
+- Acima do limite, a resposta é `429 Too Many Requests` com `Retry-After` (segundos) e corpo `ProblemDetail`. Respostas autenticadas trazem `X-RateLimit-Limit` e `X-RateLimit-Remaining`.
+- **A chave é validada antes do limite por IP.** Só tentativas inválidas gastam do balde do IP, então quem tem chave válida não é bloqueado pelos erros de outro cliente atrás do mesmo NAT.
+- **O IP é o da conexão.** `X-Forwarded-For` só é usado com `trust-forwarded-for: true`, porque sem um proxy que sobrescreva o header qualquer um trocaria de "IP" a cada tentativa.
+- O número de clientes rastreados tem teto (`max-tracked-clients`); baldes ociosos são descartados primeiro, o que não muda nada, porque um balde novo também nasce cheio.
+- `/actuator/health` não é limitado. A métrica `cronos.security.rate.limited{reason="key"|"auth"}` conta as respostas `429`.
+
+**Limitação:** o estado fica na memória de cada instância. Com N instâncias atrás de um balanceador, o limite efetivo chega a N vezes o configurado. Um limite global exigiria guardar a contagem no PostgreSQL ou num Redis.
+
+Validação contra a aplicação rodando (perfil `local`, limites padrão):
+
+| Cenário | Resultado |
+|---|---|
+| 3000 requisições com chave válida, 100 em paralelo | 785 × `200` e 2215 × `429` em 2,3 s: rajada de 400 + ~200/s, com `Retry-After: 1` |
+| ~240 req/s com chave válida por 6 s, partindo do balde cheio | 1500 × `200`: o balde absorve o excesso sobre 200/s |
+| 50 chaves erradas do mesmo IP | 10 × `401` e depois 40 × `429` com `Retry-After: 6` |
+| Requisições sem chave do mesmo IP, logo depois | todas `429` |
+| Chave válida do IP bloqueado | `200` |
+| `scripts/load.mjs` criando 1000 jobs | criação cai de ~1500/s para ~320/s, com 40 respostas `429` respeitadas; a vazão de execuções não muda (1039/s), porque os webhooks não passam pela API |
 
 ### SSRF
 
@@ -257,6 +286,13 @@ Para zerar o banco: `docker compose down -v`.
 | `cronos.security.enabled` | `true` | Exige API key |
 | `cronos.security.api-keys` | `${CRONOS_API_KEYS}` | Chaves aceitas, separadas por vírgula. Obrigatório com a segurança ligada |
 | `cronos.security.public-paths` | `/actuator/health` | Prefixos acessíveis sem chave |
+| `cronos.security.rate-limit.enabled` | `true` | Liga o rate limit |
+| `cronos.security.rate-limit.requests-per-second` | `200` | Vazão sustentada por chave |
+| `cronos.security.rate-limit.burst` | `400` | Rajada tolerada por chave |
+| `cronos.security.rate-limit.failed-auth-per-minute` | `10` | Tentativas sem chave válida aceitas por IP, por minuto |
+| `cronos.security.rate-limit.failed-auth-burst` | `10` | Rajada de tentativas sem chave válida por IP |
+| `cronos.security.rate-limit.trust-forwarded-for` | `false` | Usa `X-Forwarded-For` como IP (só atrás de proxy confiável) |
+| `cronos.security.rate-limit.max-tracked-clients` | `10000` | Teto de chaves/IPs rastreados em memória |
 | `cronos.webhook.allow-private-networks` | `false` | Libera destinos internos (só para desenvolvimento) |
 | `cronos.webhook.allowed-hosts` | `[]` | Hosts liberados mesmo resolvendo para endereço interno |
 | `cronos.webhook.allowed-ports` | `[]` | Portas aceitas nos webhooks (vazio = todas) |
@@ -397,6 +433,8 @@ Os testes unitários não dependem de banco e podem rodar isolados:
 
 - `MisfireResolverTest`: disparo dentro da tolerância, cada uma das três políticas, o limite do `FIRE_ALL`, cron com a próxima ocorrência futura e job `ONCE` perdido.
 - `ApiKeyFilterTest`: 401 sem chave ou com chave errada, `Bearer` e `X-API-Key`, várias chaves, rotas públicas por prefixo exato e falha ao subir sem chave.
+- `TokenBucketLimiterTest`: rajada e bloqueio, recarga na vazão configurada sem passar da capacidade, clientes independentes, 1000 requisições concorrentes liberando exatamente a capacidade e teto de memória.
+- `ApiKeyFilterRateLimitTest`: 429 com `Retry-After` e headers `X-RateLimit-*`, balde por chave, força bruta passando de 401 para 429, chave válida não bloqueada pelos erros de outro cliente no mesmo IP, `X-Forwarded-For` ignorado salvo configuração e limite desligado.
 - `UrlGuardTest`: bloqueio de cada faixa interna (IPv4, IPv6 e IPv4 embutido), host com um IP público e um privado, DNS que não resolve, credenciais na URL, portas e as liberações por configuração.
 - `RetryPolicyTest`: sucesso, retentativa, `DEAD` na última tentativa, falha definitiva, crescimento e teto do backoff e classificação dos status HTTP.
 
@@ -453,6 +491,7 @@ Como ler:
 - **O atraso de ~1 s com pouca carga é o intervalo de polling**, não processamento: o scheduler roda a cada 1 s e o worker a cada 500 ms, então uma ocorrência espera em média ~0,5 s por cada um. Para disparos mais pontuais, reduza `cronos.scheduler.poll-interval-ms`. O p99 alto do primeiro degrau vem do aquecimento da JVM.
 - **Até 1000 execuções/s por instância** com a configuração padrão. Acima disso, o gargalo é o worker (16 slots, cada execução faz uma escrita própria): no degrau de 2000, `cronos.scheduler.lag` ficou com p50 de 0,5 s e `cronos.execution.start.delay` com p50 de 10,7 s. Mais concorrência e conexões, ou mais instâncias, resolvem.
 - **Agrupar as escritas do scheduler fez diferença.** Antes do batch, o scheduler fazia duas idas ao banco por job e entregava só 724/s com 1000 jobs (atraso p50 de 7,6 s).
+- A tabela foi medida antes do rate limit. Com ele, a **criação** de jobs pelo script fica limitada a 200/s por chave (o script espera o `Retry-After`); a vazão de **execuções** não muda, porque os webhooks não passam pela API.
 - Os números são de uma máquina de desenvolvimento com banco, aplicação e gerador de carga juntos. Servem para comparar mudanças, não como capacidade de produção.
 
 ## Roadmap
@@ -474,12 +513,14 @@ Como ler:
 - [x] Teste de caos: matar schedulers e workers aleatoriamente e verificar que nada duplica nem se perde
 - [x] Teste de carga com números no README
 - [x] Autenticação por API key
+- [x] Rate limit por chave e por IP (tentativas inválidas)
 - [x] Proteção contra SSRF nos webhooks
 - [x] `DELETE` de jobs e retenção automática do histórico
 
 ## Limitações conhecidas
 
-- **Autenticação só por API key**, sem usuários, papéis ou escopos: quem tem uma chave pode tudo. Não há rate limiting.
+- **Autenticação só por API key**, sem usuários, papéis ou escopos: quem tem uma chave pode tudo.
+- **Rate limit por instância:** com N instâncias, o limite efetivo chega a N vezes o configurado. Veja [Rate limit](#rate-limit).
 - **Jobs criados antes da validação de payload** podem ter payload inválido; cada execução deles termina em `FAILED`.
 - **Jobs `COMPLETED` não são apagados automaticamente**, só as execuções antigas. Apague-os com `DELETE /jobs/{id}`.
 - **Cancelar não desfaz efeitos:** se a chamada já chegou ao destino, ele pode ter agido.

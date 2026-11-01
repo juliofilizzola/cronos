@@ -42,12 +42,22 @@ const receiver = http.createServer({ keepAliveTimeout: 60_000 }, (req, res) => {
     });
 });
 
+let throttled = 0; // respostas 429 recebidas (rate limit da chave)
+
 async function api(method, path, body) {
-    const res = await fetch(`${CRONOS_URL}${path}`, {
-        method,
-        headers: { ...(body ? { "content-type": "application/json" } : {}), authorization: `Bearer ${API_KEY}` },
-        body: body ? JSON.stringify(body) : undefined,
-    });
+    let res;
+    while (true) {
+        res = await fetch(`${CRONOS_URL}${path}`, {
+            method,
+            headers: { ...(body ? { "content-type": "application/json" } : {}), authorization: `Bearer ${API_KEY}` },
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        if (res.status !== 429) break;
+        // Rate limit: espera o que o servidor pediu e tenta de novo.
+        throttled++;
+        await res.arrayBuffer();
+        await sleep(Number(res.headers.get("retry-after") ?? 1) * 1000);
+    }
     const text = await res.text();
     if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${text}`);
     return text ? JSON.parse(text) : null;
@@ -87,7 +97,8 @@ async function step(n, runId) {
     const createSecs = (Date.now() - t0) / 1000;
     createLatencies.sort((a, b) => a - b);
     console.log(gray(`  ${n} jobs criados em ${createSecs.toFixed(1)}s (${Math.round(n / createSecs)}/s), ` +
-        `POST /jobs p50=${ms(pct(createLatencies, 0.5))} p95=${ms(pct(createLatencies, 0.95))}`));
+        `POST /jobs p50=${ms(pct(createLatencies, 0.5))} p95=${ms(pct(createLatencies, 0.95))}` +
+        (throttled ? `, ${throttled} respostas 429 até agora (a latência inclui a espera)` : "")));
 
     console.log(gray(`  aquecendo ${WARMUP_S}s...`));
     await sleep(WARMUP_S * 1000);

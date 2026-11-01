@@ -31,6 +31,14 @@ cronos:
     api-keys: ${CRONOS_API_KEYS:}
     public-paths:
       - /actuator/health
+    rate-limit:
+      enabled: true
+      requests-per-second: 200    # por chave, vazão sustentada
+      burst: 400                  # por chave, rajada tolerada
+      failed-auth-per-minute: 10  # por IP, tentativas sem chave válida
+      failed-auth-burst: 10
+      trust-forwarded-for: false  # ligue só atrás de um proxy que sobrescreve X-Forwarded-For
+      max-tracked-clients: 10000
   webhook:
     allow-private-networks: false
     allowed-hosts: []

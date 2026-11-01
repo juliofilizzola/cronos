@@ -129,6 +129,10 @@ async function api(method, p, body) {
                 });
                 const text = await r.text();
                 if (r.status >= 500) continue;
+                if (r.status === 429) { // rate limit: espera e tenta de novo
+                    await sleep(Number(r.headers.get("retry-after") ?? 1) * 1000);
+                    continue;
+                }
                 return { status: r.status, data: text ? JSON.parse(text) : null };
             } catch { /* instância morreu no meio: tenta outra */ }
         }
