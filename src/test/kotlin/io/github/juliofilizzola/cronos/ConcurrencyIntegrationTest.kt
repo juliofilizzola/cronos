@@ -31,7 +31,10 @@ import java.util.concurrent.TimeUnit
  * para nada concorrer com o que está sendo medido.
  */
 @Import(TestcontainersConfiguration::class)
-@SpringBootTest(properties = ["cronos.worker.enabled=false", "cronos.scheduler.poll-interval-ms=3600000"])
+@SpringBootTest(properties = [
+    "cronos.worker.enabled=false", "cronos.scheduler.poll-interval-ms=3600000",
+    "cronos.security.api-keys=test-key", "cronos.webhook.allow-private-networks=true",
+])
 class ConcurrencyIntegrationTest {
 
     @Autowired lateinit var jobs: JobService
