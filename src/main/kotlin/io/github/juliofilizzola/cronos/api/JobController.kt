@@ -38,6 +38,11 @@ class JobController(
         @RequestParam("size", defaultValue = "20") size: Int,
     ): List<ExecutionView> = service.executions(id, page.coerceAtLeast(0), size.coerceIn(1, 100))
 
+    /** Apaga o job e todo o histórico de execuções. */
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    fun delete(@PathVariable("id") id: UUID) = service.delete(id)
+
     /** Dispara o job agora, fora do agendamento. */
     @PostMapping("/{id}/trigger")
     @ResponseStatus(HttpStatus.CREATED)
