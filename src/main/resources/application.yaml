@@ -26,6 +26,20 @@ cronos:
     backoff-base: 1s
     backoff-max: 5m
     shutdown-grace: 30s
+  security:
+    enabled: true
+    api-keys: ${CRONOS_API_KEYS:}
+    public-paths:
+      - /actuator/health
+  webhook:
+    allow-private-networks: false
+    allowed-hosts: []
+    allowed-ports: []
+  retention:
+    enabled: true
+    executions-max-age: 30d
+    interval-ms: 3600000
+    batch-size: 1000
 
 management:
   endpoints:

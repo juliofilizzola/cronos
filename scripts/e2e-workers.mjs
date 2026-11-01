@@ -12,6 +12,9 @@
 //   WEBHOOK_HOST   Host que o worker usa p/ chegar no receptor (padrão: localhost;
 //                  use host.docker.internal se o Cronos rodar em container)
 //   DURATION_S     Duração do teste em segundos     (padrão: 30)
+//   CRONOS_API_KEY Chave da API                     (padrão: dev-key, a do perfil local)
+//
+// O Cronos precisa aceitar webhooks em localhost: o perfil "local" (./gradlew bootRun) já libera.
 
 import http from "node:http";
 
@@ -19,6 +22,7 @@ const CRONOS_URL = process.env.CRONOS_URL ?? "http://localhost:8080";
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 4000);
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST ?? "localhost";
 const DURATION_S = Number(process.env.DURATION_S ?? 30);
+const API_KEY = process.env.CRONOS_API_KEY ?? "dev-key";
 const POLL_MS = 1000;
 
 const RUN_ID = Date.now().toString(36);
@@ -163,12 +167,19 @@ const server = http.createServer((req, res) => {
 // ---------------------------------------------------------------------------
 // Cliente da API
 // ---------------------------------------------------------------------------
-async function api(method, path, body) {
-    const res = await fetch(`${CRONOS_URL}${path}`, {
+async function raw(method, path, body, apiKey = API_KEY) {
+    return fetch(`${CRONOS_URL}${path}`, {
         method,
-        headers: body ? { "content-type": "application/json" } : {},
+        headers: {
+            ...(body ? { "content-type": "application/json" } : {}),
+            ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
         body: body ? JSON.stringify(body) : undefined,
     });
+}
+
+async function api(method, path, body) {
+    const res = await raw(method, path, body);
     const text = await res.text();
     const data = text ? JSON.parse(text) : null;
     if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${text}`);
@@ -224,6 +235,7 @@ function summarize() {
     // ---- Verificações ----
     const checks = [];
     const check = (ok, msg, detail = "") => checks.push({ ok, msg, detail });
+    checks.push(...preChecks);
 
     // 1. Nenhuma ocorrência duplicada (UNIQUE job_id + scheduled_for)
     const dupOcc = all.length - new Set(all.map((e) => `${e.jobId}|${e.scheduledFor}`)).size;
@@ -299,10 +311,51 @@ function summarize() {
     return failed;
 }
 
+// ---------------------------------------------------------------------------
+// Verificações rápidas de segurança e manutenção, antes dos cenários
+// ---------------------------------------------------------------------------
+const preChecks = [];
+
+async function runPreChecks() {
+    const check = (ok, msg, detail = "") => {
+        preChecks.push({ ok, msg, detail });
+        log(ok ? green("✔") : red("✘"), msg, detail ? gray(`(${detail})`) : "");
+    };
+    const job = (url) => ({
+        name: `e2e-${RUN_ID}-pre`, scheduleType: "ONCE", scheduleExpr: "2099-01-01T00:00:00Z",
+        payload: { url, method: "POST" },
+    });
+
+    const noKey = await raw("GET", "/jobs", null, null);
+    const badKey = await raw("GET", "/jobs", null, "chave-errada");
+    const health = await raw("GET", "/actuator/health", null, null);
+    check(noKey.status === 401 && badKey.status === 401 && health.ok,
+        "API exige chave (401 sem chave ou com chave errada; health público)",
+        `sem=${noKey.status} errada=${badKey.status} health=${health.status}`);
+
+    // O perfil local libera redes privadas; se este Cronos não liberar, o teste é pulado.
+    const metadata = await raw("POST", "/jobs", job("http://169.254.169.254/latest/meta-data"));
+    const metadataBody = await metadata.text();
+    if (metadata.status === 400) {
+        check(metadataBody.includes("bloqueado"), "SSRF: job apontando para o metadata da nuvem é recusado (400)");
+    } else {
+        log(yellow("•"), gray("SSRF não verificado: este Cronos libera redes privadas (cronos.webhook.allow-private-networks)"));
+        if (metadata.ok) await raw("DELETE", `/jobs/${JSON.parse(metadataBody).id}`);
+    }
+
+    const created = await api("POST", "/jobs", job(hook("/ok")));
+    await api("POST", `/jobs/${created.id}/trigger`);
+    const del = await raw("DELETE", `/jobs/${created.id}`);
+    const after = await raw("GET", `/jobs/${created.id}`);
+    check(del.status === 204 && after.status === 404, "DELETE /jobs/{id} apaga o job e o histórico",
+        `delete=${del.status} get=${after.status}`);
+    console.log();
+}
+
 async function cleanup() {
-    // Não existe DELETE na API: pausa os jobs para não continuarem gerando execuções.
+    // Apaga os jobs do teste (e o histórico deles) para não acumularem no banco.
     for (const job of jobs) {
-        try { await api("POST", `/jobs/${job.id}/pause`); } catch { /* COMPLETED ou já pausado */ }
+        try { await api("DELETE", `/jobs/${job.id}`); } catch { /* já apagado */ }
     }
     server.close();
 }
@@ -318,6 +371,8 @@ async function main() {
         console.error(gray(e.message));
         process.exit(2);
     }
+
+    await runPreChecks();
 
     await new Promise((resolve) => server.listen(WEBHOOK_PORT, resolve));
     console.log(bold(`Receptor de webhooks em http://localhost:${WEBHOOK_PORT}`), gray(`(worker deve chamar ${hook("/...")})`));

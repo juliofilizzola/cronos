@@ -12,6 +12,7 @@
 //   WARMUP_S       aquecimento antes de medir                (padrão: 10)
 //   MEASURE_S      janela de medição                         (padrão: 30)
 //   WEBHOOK_PORT   porta do receptor                         (padrão: 4200)
+//   CRONOS_API_KEY chave da API                              (padrão: dev-key)
 
 import http from "node:http";
 import os from "node:os";
@@ -21,6 +22,7 @@ const STEPS = (process.env.STEPS ?? "100,250,500,1000").split(",").map(Number);
 const WARMUP_S = Number(process.env.WARMUP_S ?? 10);
 const MEASURE_S = Number(process.env.MEASURE_S ?? 30);
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 4200);
+const API_KEY = process.env.CRONOS_API_KEY ?? "dev-key";
 
 const c = (code) => (s) => (process.stdout.isTTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const gray = c(90), green = c(32), red = c(31), bold = c(1);
@@ -43,7 +45,7 @@ const receiver = http.createServer({ keepAliveTimeout: 60_000 }, (req, res) => {
 async function api(method, path, body) {
     const res = await fetch(`${CRONOS_URL}${path}`, {
         method,
-        headers: body ? { "content-type": "application/json" } : {},
+        headers: { ...(body ? { "content-type": "application/json" } : {}), authorization: `Bearer ${API_KEY}` },
         body: body ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
@@ -98,7 +100,7 @@ async function step(n, runId) {
     const got = samples;
     samples = null;
 
-    await pool(ids, 20, (id) => api("POST", `/jobs/${id}/pause`));
+    await pool(ids, 20, (id) => api("DELETE", `/jobs/${id}`));
 
     const delays = got.map((s) => s.at - s.scheduledFor).sort((a, b) => a - b);
     const rate = got.length / ((windowEnd - windowStart) / 1000);

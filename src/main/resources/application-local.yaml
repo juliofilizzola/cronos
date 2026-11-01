@@ -1,0 +1,5 @@
+cronos:
+  security:
+    api-keys: ${CRONOS_API_KEYS:dev-key}
+  webhook:
+    allow-private-networks: true

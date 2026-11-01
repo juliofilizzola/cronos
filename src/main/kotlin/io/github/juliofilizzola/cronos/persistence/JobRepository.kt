@@ -47,6 +47,21 @@ class JobRepository(
             )
         }
 
+    /**
+     * Apaga o job e todo o histórico dele. Retorna false se o job não existe.
+     *
+     * Trava a linha do job antes de apagar as execuções: com o lock, o scheduler (SKIP LOCKED)
+     * não consegue criar uma execução nova entre os dois DELETEs, o que quebraria a FK.
+     * Deve rodar dentro de uma transação.
+     */
+    fun deleteWithHistory(id: UUID): Boolean {
+        val locked = jdbc.queryForList("SELECT id FROM jobs WHERE id = ? FOR UPDATE", UUID::class.java, id)
+        if (locked.isEmpty()) return false
+        jdbc.update("DELETE FROM executions WHERE job_id = ?", id)
+        jdbc.update("DELETE FROM jobs WHERE id = ?", id)
+        return true
+    }
+
     /** Só muda se o status atual for [from]. Retorna quantas linhas mudaram (0 ou 1). */
     fun updateStatus(id: UUID, from: JobStatus, to: JobStatus): Int =
         jdbc.update("UPDATE jobs SET status = ? WHERE id = ? AND status = ?", to.name, id, from.name)

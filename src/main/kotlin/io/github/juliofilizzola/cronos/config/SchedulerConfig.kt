@@ -2,6 +2,8 @@ package io.github.juliofilizzola.cronos.config
 
 import io.github.juliofilizzola.cronos.scheduling.MisfireResolver
 import io.github.juliofilizzola.cronos.scheduling.NextFireCalculator
+import io.github.juliofilizzola.cronos.scheduling.RetentionProperties
+import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.scheduling.annotation.EnableScheduling
@@ -9,6 +11,7 @@ import java.time.Clock
 
 @Configuration
 @EnableScheduling
+@EnableConfigurationProperties(RetentionProperties::class)
 class SchedulerConfig {
     @Bean fun clock(): Clock = Clock.systemUTC()
     @Bean fun nextFireCalculator() = NextFireCalculator()

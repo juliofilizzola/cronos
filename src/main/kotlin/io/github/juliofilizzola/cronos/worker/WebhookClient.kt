@@ -1,6 +1,7 @@
 package io.github.juliofilizzola.cronos.worker
 
 import io.github.juliofilizzola.cronos.persistence.ClaimedExecution
+import io.github.juliofilizzola.cronos.security.UrlGuard
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import java.net.URI
@@ -25,6 +26,7 @@ data class WebhookPayload(
 /** Faz a chamada HTTP de uma execução e traduz o resultado para [AttemptResult]. */
 class WebhookClient(
     private val jsonMapper: JsonMapper,
+    private val guard: UrlGuard,
     private val http: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
         .followRedirects(HttpClient.Redirect.NEVER)
@@ -41,6 +43,8 @@ class WebhookClient(
         } catch (e: Exception) {
             return AttemptResult.Failure("payload inválido: ${e.message}", retryable = false)
         }
+        // Checado a cada chamada, não só na criação: o DNS do host pode ter mudado desde então.
+        guard.check(request.uri())?.let { return AttemptResult.Failure(it.reason, it.retryable) }
 
         // Prazo total (conexão + resposta + corpo), não só até os headers chegarem.
         val future = http.sendAsync(request, HttpResponse.BodyHandlers.ofString())

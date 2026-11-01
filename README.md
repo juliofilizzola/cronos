@@ -14,6 +14,8 @@ Você cadastra jobs com um agendamento (cron, intervalo ou execução única) e 
 - [Política de misfire](#política-de-misfire)
 - [Como o worker funciona](#como-o-worker-funciona)
 - [Métricas](#métricas)
+- [Segurança](#segurança)
+- [Retenção do histórico](#retenção-do-histórico)
 - [Stack](#stack)
 - [Como rodar](#como-rodar)
 - [API](#api)
@@ -158,8 +160,44 @@ Expostas em `/actuator/prometheus`. Os nomes abaixo estão no formato do Microme
 | `cronos.webhook.duration{result}` | timer | Duração das chamadas ao webhook, por `success`/`failure` |
 | `cronos.worker.inflight` | gauge | Execuções em andamento nesta instância |
 | `cronos.worker.reaped` | contador | Execuções recuperadas de workers que pararam de responder |
+| `cronos.retention.deleted` | contador | Execuções apagadas pela retenção |
 
 Taxa de falha, por exemplo: `sum(rate(cronos_worker_executions_total{outcome=~"retry|dead|failed"}[5m])) / sum(rate(cronos_worker_executions_total[5m]))`.
+
+## Segurança
+
+### Autenticação
+
+Cada requisição precisa de uma API key em `Authorization: Bearer <chave>` ou `X-API-Key: <chave>`; sem ela, a resposta é `401` com `WWW-Authenticate: Bearer`. Só `/actuator/health` é público, para os probes de liveness e readiness.
+
+- **Sem chave configurada, a aplicação não sobe.** Isso evita publicar por engano uma API aberta.
+- **Várias chaves ao mesmo tempo**, para rotação: adicione a nova em `CRONOS_API_KEYS`, migre os clientes e remova a antiga.
+- **Comparação em tempo constante** sobre o SHA-256 das chaves, para o tempo de resposta não revelar quanto da chave está certo.
+- É um filtro de servlet simples, sem Spring Security: todas as chaves têm o mesmo acesso. Não há usuários, papéis nem escopos por job.
+
+### SSRF
+
+Sem proteção, qualquer um com acesso à API poderia criar um job apontando para `http://169.254.169.254/` (credenciais da nuvem), para o PostgreSQL ou para serviços internos, e o worker faria a chamada de dentro da rede. Por isso o [`UrlGuard`](src/main/kotlin/io/github/juliofilizzola/cronos/security/UrlGuard.kt):
+
+- resolve o host e recusa se **qualquer** um dos endereços for interno: loopback, `0.0.0.0/8`, `10/8`, `172.16/12`, `192.168/16`, `100.64/10` (CGNAT), `169.254/16` (link-local e metadata da nuvem), multicast e reservados, e no IPv6 `::1`, `fc00::/7`, `fe80::/10` e IPv4 embutido (`::ffff:a.b.c.d`, NAT64);
+- recusa credenciais na URL (`http://user:pass@...`) e, se configurado, portas fora de `allowed-ports`;
+- roda **na criação do job** (`400`) e **de novo antes de cada chamada** do worker, porque o DNS do host pode ter mudado desde a criação. No worker, destino bloqueado vira `FAILED` sem retentativa; host que não resolve é falha temporária;
+- não segue redirecionamentos, então um `302` para um endereço interno não é seguido.
+
+Para liberar um serviço interno conhecido, use `cronos.webhook.allowed-hosts`. `allow-private-networks: true` desliga a checagem e só deve ser usado em desenvolvimento.
+
+**Limitação:** a checagem acontece antes da conexão, e o `HttpClient` resolve o nome de novo ao conectar. Um DNS malicioso com TTL zero (*DNS rebinding*) ainda pode trocar o IP nesse intervalo. Para fechar isso de vez, faça a saída do worker passar por um proxy de egress que aplique a mesma regra, ou restrinja a rede no nível do container ou da VPC.
+
+## Retenção do histórico
+
+`DELETE /jobs/{id}` apaga o job e todas as execuções dele numa transação. A linha do job é travada antes, para que o scheduler (que usa `SKIP LOCKED`) não crie uma execução nova no meio. Se houver uma execução em andamento, o resultado dela é descartado pelo worker, porque a linha não existe mais.
+
+A limpeza automática ([`ExecutionRetention`](src/main/kotlin/io/github/juliofilizzola/cronos/scheduling/ExecutionRetention.kt)) roda a cada hora em todas as instâncias e apaga execuções **terminadas** (`SUCCEEDED`, `FAILED`, `DEAD`, `CANCELLED`) com `finished_at` mais antigo que 30 dias. `PENDING` e `RUNNING` nunca são apagadas, nem os jobs.
+
+- Apaga em lotes de 1000 até não sobrar nada vencido, para não segurar locks nem gerar uma transação enorme.
+- Usa `FOR UPDATE SKIP LOCKED`: várias instâncias limpam ao mesmo tempo sem disputar linhas.
+- A migration `V4` cria um índice parcial em `finished_at` só para os status terminados, então a busca não varre a fila.
+- A métrica `cronos.retention.deleted` conta o que foi apagado.
 
 ## Stack
 
@@ -190,6 +228,12 @@ docker compose up -d
 
 A API fica em `http://localhost:8080`. O scheduler começa a rodar junto com a aplicação.
 
+O `bootRun` ativa o perfil `local` ([`application-local.yaml`](src/main/resources/application-local.yaml)), que define a chave de API `dev-key` e libera webhooks em `localhost` para os scripts de teste. Fora dele (o jar, em produção), a aplicação **não sobe sem chave**:
+
+```bash
+CRONOS_API_KEYS=uma-chave-longa-e-aleatoria java -jar build/libs/Cronos-0.0.1-SNAPSHOT.jar
+```
+
 Para zerar o banco: `docker compose down -v`.
 
 ### Configuração
@@ -210,10 +254,22 @@ Para zerar o banco: `docker compose down -v`.
 | `cronos.worker.backoff-base` | `1s` | Espera antes da 2ª tentativa |
 | `cronos.worker.backoff-max` | `5m` | Teto do backoff |
 | `cronos.worker.shutdown-grace` | `30s` | Espera pelas execuções em andamento ao desligar |
+| `cronos.security.enabled` | `true` | Exige API key |
+| `cronos.security.api-keys` | `${CRONOS_API_KEYS}` | Chaves aceitas, separadas por vírgula. Obrigatório com a segurança ligada |
+| `cronos.security.public-paths` | `/actuator/health` | Prefixos acessíveis sem chave |
+| `cronos.webhook.allow-private-networks` | `false` | Libera destinos internos (só para desenvolvimento) |
+| `cronos.webhook.allowed-hosts` | `[]` | Hosts liberados mesmo resolvendo para endereço interno |
+| `cronos.webhook.allowed-ports` | `[]` | Portas aceitas nos webhooks (vazio = todas) |
+| `cronos.retention.enabled` | `true` | Liga a limpeza do histórico |
+| `cronos.retention.executions-max-age` | `30d` | Idade a partir da qual execuções terminadas são apagadas |
+| `cronos.retention.interval-ms` | `3600000` | Intervalo entre limpezas |
+| `cronos.retention.batch-size` | `1000` | Linhas apagadas por comando |
 
 ## API
 
-O arquivo [`jobs.http`](jobs.http) tem exemplos prontos para o cliente HTTP do IntelliJ.
+O arquivo [`jobs.http`](jobs.http) tem exemplos prontos para o cliente HTTP do IntelliJ (ambiente `local`, definido em [`http-client.env.json`](http-client.env.json)).
+
+Toda rota exige `Authorization: Bearer <chave>` (ou `X-API-Key: <chave>`), exceto `/actuator/health`. Veja [Segurança](#segurança).
 
 | Método | Rota | Descrição |
 |---|---|---|
@@ -223,17 +279,19 @@ O arquivo [`jobs.http`](jobs.http) tem exemplos prontos para o cliente HTTP do I
 | `GET` | `/jobs/{id}/executions` | Histórico de execuções |
 | `POST` | `/jobs/{id}/pause` | Pausa um job `ACTIVE` |
 | `POST` | `/jobs/{id}/resume` | Retoma um job `PAUSED` |
+| `DELETE` | `/jobs/{id}` | Apaga o job e todo o histórico de execuções (`204`) |
 | `POST` | `/jobs/{id}/trigger` | Dispara o job agora, fora do agendamento |
 | `GET` | `/executions/{id}` | Detalhe de uma execução |
 | `POST` | `/executions/{id}/cancel` | Cancela uma execução `PENDING` ou `RUNNING` |
 | `POST` | `/executions/{id}/retry` | Recoloca na fila uma execução `DEAD` ou `FAILED` |
-| `GET` | `/actuator/health` | Saúde da aplicação |
-| `GET` | `/actuator/prometheus` | Métricas |
+| `GET` | `/actuator/health` | Saúde da aplicação (pública) |
+| `GET` | `/actuator/prometheus` | Métricas (exige chave; configure o scrape com `authorization.credentials`) |
 
 ### Criar um job
 
 ```bash
 curl -X POST http://localhost:8080/jobs \
+  -H "Authorization: Bearer dev-key" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "relatorio-horario",
@@ -254,7 +312,7 @@ curl -X POST http://localhost:8080/jobs \
 | `headers` | não | Objeto de strings, enviado como headers |
 | `body` | não | Qualquer JSON, enviado como corpo com `Content-Type: application/json` |
 
-O payload é validado na criação do job (`400` se inválido).
+O payload é validado na criação do job (`400` se inválido), incluindo a [proteção contra SSRF](#ssrf).
 
 ### Formatos de agendamento
 
@@ -277,7 +335,7 @@ O payload é validado na criação do job (`400` se inválido).
 
 ### Erros
 
-As respostas de erro seguem o formato `ProblemDetail` (RFC 7807): `400` para agendamento, payload ou campos inválidos, `404` para job ou execução inexistente e `409` para transição de status inválida (por exemplo, pausar um job já pausado, cancelar uma execução já concluída ou disparar manualmente um job sem sobreposição que já tem execução ativa).
+As respostas de erro seguem o formato `ProblemDetail` (RFC 7807): `401` sem chave ou com chave inválida, `400` para agendamento, payload ou campos inválidos, `404` para job ou execução inexistente e `409` para transição de status inválida (por exemplo, pausar um job já pausado, cancelar uma execução já concluída ou disparar manualmente um job sem sobreposição que já tem execução ativa).
 
 ## Decisões de projeto
 
@@ -301,6 +359,7 @@ As respostas de erro seguem o formato `ProblemDetail` (RFC 7807): `400` para age
 cronos/
 ├── docker-compose.yaml
 ├── jobs.http
+├── http-client.env.json      # chave de API do ambiente "local" para o jobs.http
 ├── scripts/
 │   ├── e2e-workers.mjs     # teste ponta a ponta com receptor de webhooks
 │   ├── chaos.mjs           # mata instâncias aleatoriamente e verifica duplicidade e perda
@@ -311,13 +370,14 @@ cronos/
     │   │   ├── api/           # controllers, DTO de entrada, tratamento de erros
     │   │   ├── service/       # regras de negócio, validação de agendamento e de payload
     │   │   ├── persistence/   # repositórios com SQL explícito (jobs e executions)
-    │   │   ├── scheduling/    # SchedulerLoop, MisfireResolver, NextFireCalculator
+    │   │   ├── scheduling/    # SchedulerLoop, MisfireResolver, NextFireCalculator, ExecutionRetention
     │   │   ├── worker/        # Worker, WebhookClient, RetryPolicy, WorkerProperties
+    │   │   ├── security/      # ApiKeyFilter, UrlGuard (SSRF)
     │   │   ├── domain/        # Job, JobDetails, enums, exceções
-    │   │   └── config/        # beans (Clock, calculadora, resolver, retry, cliente HTTP)
+    │   │   └── config/        # beans (Clock, calculadora, resolver, retry, cliente HTTP, filtro de API key)
     │   └── resources/
     │       ├── application.yaml
-    │       └── db/migration/  # V1__init, V2__misfire_and_completed, V3__manual_trigger_and_cancel
+    │       └── db/migration/  # V1__init, V2__misfire_and_completed, V3__manual_trigger_and_cancel, V4__retention_index
     └── test/kotlin/...        # testes unitários e de integração (Testcontainers)
 ```
 
@@ -336,22 +396,26 @@ Os testes unitários não dependem de banco e podem rodar isolados:
 ```
 
 - `MisfireResolverTest`: disparo dentro da tolerância, cada uma das três políticas, o limite do `FIRE_ALL`, cron com a próxima ocorrência futura e job `ONCE` perdido.
+- `ApiKeyFilterTest`: 401 sem chave ou com chave errada, `Bearer` e `X-API-Key`, várias chaves, rotas públicas por prefixo exato e falha ao subir sem chave.
+- `UrlGuardTest`: bloqueio de cada faixa interna (IPv4, IPv6 e IPv4 embutido), host com um IP público e um privado, DNS que não resolve, credenciais na URL, portas e as liberações por configuração.
 - `RetryPolicyTest`: sucesso, retentativa, `DEAD` na última tentativa, falha definitiva, crescimento e teto do backoff e classificação dos status HTTP.
 
 Testes de integração:
 
 - `ConcurrencyIntegrationTest`: 8 threads disputando o claim de 300 execuções sem nenhuma reservada duas vezes; resultado de worker que perdeu a reserva descartado; reaper devolvendo para a fila ou marcando `DEAD`; heartbeat protegendo execução viva; 4 schedulers simultâneos recuperando 30 s perdidos de 20 jobs sem duplicar nem deixar buracos; transições de disparo manual, cancelamento e retentativa.
+- `MaintenanceIntegrationTest`: `DELETE` apagando job e histórico; retenção apagando só execuções terminadas e antigas, em lotes, sem tocar em `PENDING`/`RUNNING` nem no job.
+- `SsrfIntegrationTest`: com a configuração padrão, a criação recusa `localhost`, metadata da nuvem, redes privadas e `::1`, e aceita um IP público.
 - `WorkerIntegrationTest`: worker real contra um servidor HTTP local: sucesso com `Idempotency-Key`, 500 retentado até `DEAD`, 404 sem retentativa, timeout, cancelamento interrompendo uma chamada em andamento e retentativa de `DEAD` com o mesmo id.
 
 ### Teste ponta a ponta
 
-Com a aplicação rodando, o script [`scripts/e2e-workers.mjs`](scripts/e2e-workers.mjs) (Node 22, sem dependências) sobe um receptor de webhooks na porta 4000, cria sete jobs (sucesso, sem sobreposição, falha 500, webhook lento, disparo manual, cancelamento e `ONCE`), mostra cada transição de status e cada chamada recebida em tempo real e, no fim, roda 14 verificações: nada duplicado, entrega única, `Idempotency-Key`, sobreposição, retentativas, `DEAD`, timeout, disparo manual, cancelamento de execução em andamento, retentativa de `DEAD` via API e `ONCE`.
+Com a aplicação rodando, o script [`scripts/e2e-workers.mjs`](scripts/e2e-workers.mjs) (Node 22, sem dependências) sobe um receptor de webhooks na porta 4000, cria sete jobs (sucesso, sem sobreposição, falha 500, webhook lento, disparo manual, cancelamento e `ONCE`), mostra cada transição de status e cada chamada recebida em tempo real e, no fim, roda 16 verificações: API exige chave, `DELETE` apaga job e histórico, nada duplicado, entrega única, `Idempotency-Key`, sobreposição, retentativas, `DEAD`, timeout, disparo manual, cancelamento de execução em andamento, retentativa de `DEAD` via API e `ONCE`.
 
 ```bash
 node scripts/e2e-workers.mjs
 ```
 
-Variáveis: `CRONOS_URL` (padrão `http://localhost:8080`), `WEBHOOK_PORT` (`4000`), `WEBHOOK_HOST` (`localhost`; use `host.docker.internal` se o Cronos rodar em container) e `DURATION_S` (`30`). Sai com código 0 se tudo passar. Os jobs criados são pausados no final.
+Variáveis: `CRONOS_URL` (padrão `http://localhost:8080`), `CRONOS_API_KEY` (`dev-key`), `WEBHOOK_PORT` (`4000`), `WEBHOOK_HOST` (`localhost`; use `host.docker.internal` se o Cronos rodar em container) e `DURATION_S` (`30`). O Cronos precisa aceitar webhooks em `localhost`, o que o perfil `local` já faz. Sai com código 0 se tudo passar. Os jobs criados são apagados no final.
 
 ### Teste de caos
 
@@ -409,14 +473,17 @@ Como ler:
 - [x] Testes de integração com Testcontainers
 - [x] Teste de caos: matar schedulers e workers aleatoriamente e verificar que nada duplica nem se perde
 - [x] Teste de carga com números no README
+- [x] Autenticação por API key
+- [x] Proteção contra SSRF nos webhooks
+- [x] `DELETE` de jobs e retenção automática do histórico
 
 ## Limitações conhecidas
 
-- **Sem autenticação** na API.
+- **Autenticação só por API key**, sem usuários, papéis ou escopos: quem tem uma chave pode tudo. Não há rate limiting.
 - **Jobs criados antes da validação de payload** podem ter payload inválido; cada execução deles termina em `FAILED`.
-- **Sem DELETE de jobs nem limpeza do histórico:** a tabela `executions` cresce indefinidamente.
+- **Jobs `COMPLETED` não são apagados automaticamente**, só as execuções antigas. Apague-os com `DELETE /jobs/{id}`.
 - **Cancelar não desfaz efeitos:** se a chamada já chegou ao destino, ele pode ter agido.
-- **Sem proteção contra SSRF:** o worker chama qualquer URL `http`/`https` do payload, inclusive endereços internos.
+- **SSRF por DNS rebinding:** o `UrlGuard` checa o IP antes da conexão, mas um DNS malicioso pode trocá-lo no intervalo. Veja [SSRF](#ssrf).
 - **Dependência de relógio:** o scheduler usa o relógio da JVM. Com instâncias com horários muito diferentes, os disparos podem variar levemente. Usar o `now()` do PostgreSQL é uma alternativa avaliada.
 - **Garantia de entrega:** *at-least-once*, o que exige idempotência do lado de quem recebe. O `id` da execução vai no header `Idempotency-Key`.
 
