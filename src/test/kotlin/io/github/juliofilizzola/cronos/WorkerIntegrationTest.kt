@@ -28,6 +28,8 @@ import java.util.concurrent.Executors
         "cronos.worker.backoff-base=100ms",
         "cronos.worker.poll-interval-ms=100",
         "cronos.worker.cancel-check-interval-ms=200",
+        "cronos.security.api-keys=test-key",
+        "cronos.webhook.allow-private-networks=true", // o servidor de teste roda em 127.0.0.1
     ]
 )
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
