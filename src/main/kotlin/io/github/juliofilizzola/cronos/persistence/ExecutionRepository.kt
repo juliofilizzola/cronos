@@ -156,6 +156,24 @@ class ExecutionRepository(private val jdbc: JdbcTemplate) {
             status, finishedAt?.let(::utc), runAfter?.let(::utc), error?.take(MAX_ERROR), id, workerId,
         )
 
+    /**
+     * Retenção: apaga até [limit] execuções terminadas antes de [before]. SKIP LOCKED deixa
+     * várias instâncias limparem ao mesmo tempo sem disputar as mesmas linhas.
+     * Retorna quantas apagou.
+     */
+    fun deleteFinishedBefore(before: Instant, limit: Int): Int =
+        jdbc.update(
+            """
+            DELETE FROM executions WHERE id IN (
+                SELECT id FROM executions
+                WHERE status IN ('SUCCEEDED', 'FAILED', 'DEAD', 'CANCELLED') AND finished_at < ?
+                LIMIT ?
+                FOR UPDATE SKIP LOCKED
+            )
+            """.trimIndent(),
+            utc(before), limit,
+        )
+
     /** Heartbeat: renova o lease de tudo que este worker está executando. */
     fun extendLeases(workerId: String, leaseUntil: Instant): Int =
         jdbc.update(
